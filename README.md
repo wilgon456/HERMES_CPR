@@ -1,55 +1,110 @@
 # HERMES_CPR
 
-죽은 Hermes 게이트웨이를 다시 살리는 외부 복구 에이전트입니다.
+External CPR/watchdog utility for an **existing Hermes gateway deployment**.
 
-이 저장소는 `hermes-agent` 바깥에서 주기적으로 상태를 점검하고, 아래 상황에서 자동 복구를 시도합니다.
+HERMES_CPR is **not** a standalone chatbot or a generic process supervisor. It is a small companion tool that runs **outside** your `hermes-agent` repo, checks the gateway runtime state, and tries to recover the gateway only when recovery is actually warranted.
 
-- 게이트웨이 프로세스가 죽었을 때: `hermes gateway start`
-- 게이트웨이가 `startup_failed` 상태일 때: `hermes gateway restart`
-- 게이트웨이가 `draining` 상태로 너무 오래 멈춰 있을 때: `hermes gateway restart`
-- `running` 상태인데 플랫폼 연결이 전부 깨진 채 stale 상태가 **연속 확인**될 때만: `hermes gateway restart`
+---
 
-## 왜 이렇게 바꿨나
+## What this project does
 
-기존 CPR은 `gateway_state.json`의 `updated_at`이 오래됐다는 이유만으로 재시작을 걸 수 있었습니다.
-그런데 Hermes 게이트웨이는 정상 동작 중에도 상태 파일을 heartbeat처럼 자주 갱신하지 않을 수 있어서,
-`alive=True` + `gateway_state=running`인데도 조용하다는 이유만으로 재시작 루프가 생길 수 있었습니다.
+HERMES_CPR periodically inspects Hermes runtime files and attempts recovery in these cases:
 
-이제 CPR은 아래 원칙으로 동작합니다.
+- the Hermes gateway process is missing → `hermes gateway start`
+- the gateway is in `startup_failed` → `hermes gateway restart`
+- the gateway is stuck in `draining` longer than allowed → `hermes gateway restart`
+- the gateway is `running`, but runtime state is stale **and** all platform states are degraded for multiple consecutive checks → `hermes gateway restart`
 
-- **프로세스 생존**이 최우선 신호입니다.
-- `running` 상태에서는 **플랫폼 상태가 실제로 망가졌는지** 함께 봅니다.
-- **active agent가 남아 있으면** stale restart를 하지 않습니다.
-- stale만으로는 바로 재시작하지 않고, **연속 N회 확인**된 경우에만 재시작합니다.
-- 플랫폼 telemetry가 없거나, 하나라도 `connected`면 stale restart를 하지 않습니다.
+It is intentionally conservative:
 
-즉 CPR은 다시 "죽었을 때 살리는 장치"에 가깝게 동작합니다.
+- **process liveness is the top-level signal**
+- a healthy `running` gateway is **not** restarted just because `updated_at` stopped moving
+- a `running` gateway with at least one connected platform is protected
+- a `running` gateway with active agents is protected
+- stale restart decisions require repeated confirmation
 
-## 동작 방식
+---
 
-입력:
+## Who this is for
 
-- `HERMES_HOME/gateway_state.json`
-- `HERMES_HOME/gateway.pid` 또는 상태 파일의 PID
-- 로컬 `hermes` CLI
+Use this repo if all of the following are true:
 
-판정:
+1. You already run a Hermes gateway from the [`hermes-agent`](https://github.com/NousResearch/hermes-agent) codebase.
+2. Your Hermes environment writes runtime state such as `gateway_state.json` and `gateway.pid`.
+3. You want an **external** recovery loop instead of making the Hermes process self-resurrect.
 
-- PID가 살아 있는지 확인
-- `gateway_state`
-- `updated_at`
-- `platforms.*.state`
-- stale 연속 확인 횟수
+If you want a standalone monitoring framework for arbitrary processes, this repo is not that.
 
-복구:
+---
 
-- 죽어 있으면 `start`
-- 살아 있지만 `startup_failed` / `draining stuck`이면 `restart`
-- `running` + stale여도 바로 재시작하지 않고, **모든 플랫폼이 degraded인 상태가 연속 확인될 때만** `restart`
+## Prerequisites
 
-## 설정
+Before installing HERMES_CPR, you should already have:
 
-`config.example.json`을 `config.json`으로 복사해서 사용합니다.
+- a working clone of `hermes-agent`
+- a valid Hermes profile / `HERMES_HOME`
+- a Hermes gateway deployment that produces:
+  - `gateway_state.json`
+  - `gateway.pid`
+- a Python environment where the Hermes CLI binary exists in **one of**:
+  - `repo_root/venv/bin/hermes`
+  - `repo_root/.venv/bin/hermes`
+
+HERMES_CPR currently assumes the Hermes executable is available from that repo-local virtualenv. If your deployment uses a different packaging/layout, adjust `resolve_hermes_bin()` in `hermes_cpr.py`.
+
+---
+
+## Quick Start
+
+### 1. Clone this repo
+
+```bash
+git clone https://github.com/wilgon456/HERMES_CPR.git
+cd HERMES_CPR
+```
+
+### 2. Create your local config
+
+```bash
+cp config.example.json config.json
+```
+
+Edit `config.json` for your environment.
+
+Example:
+
+```json
+{
+  "repo_root": "/opt/hermes-agent",
+  "hermes_home": "/home/you/.hermes/profiles/main",
+  "profile": "main",
+  "stale_seconds": 600,
+  "draining_stuck_seconds": 600,
+  "stale_confirmations": 3,
+  "log_file": "/home/you/.hermes/profiles/main/logs/hermes-cpr.log",
+  "tracker_file": "/home/you/.hermes/profiles/main/logs/hermes-cpr-state.json"
+}
+```
+
+### 3. Run once manually
+
+```bash
+python3 hermes_cpr.py --config config.json
+```
+
+### 4. Install a scheduler
+
+Choose one:
+
+- macOS → launchd
+- Linux → systemd timer or cron
+- Windows → Task Scheduler
+
+---
+
+## Configuration
+
+`config.example.json` documents the expected fields:
 
 ```json
 {
@@ -64,71 +119,155 @@
 }
 ```
 
-설명:
+Field meanings:
 
-- `stale_seconds`: stale로 간주하기 시작하는 기준 시간
-- `draining_stuck_seconds`: `draining` 고착 판정 시간
-- `stale_confirmations`: stale + degraded 상태가 몇 번 연속 확인돼야 재시작할지
-- `tracker_file`: 연속 stale 확인 횟수를 저장하는 파일
+- `repo_root`: path to your `hermes-agent` checkout
+- `hermes_home`: Hermes home/profile directory containing runtime files
+- `profile`: Hermes profile name passed to the CLI
+- `stale_seconds`: how old `updated_at` must be before stale logic begins
+- `draining_stuck_seconds`: grace period before a `draining` gateway is considered stuck
+- `stale_confirmations`: number of consecutive degraded stale checks required before restart
+- `log_file`: CPR log destination
+- `tracker_file`: state file for repeated stale confirmation tracking
 
-## 권장 운영값
+### Recommended operating values
 
-Hermes를 **살리는 것**이 목적이라면, 아래처럼 보수적으로 두는 편이 안전합니다.
+If your priority is **revive dead Hermes, do not flap healthy Hermes**, these defaults are intentionally conservative:
 
-- `stale_seconds`: **600 이상 권장**
-- `stale_confirmations`: **3 이상 권장**
-- launchd/Task Scheduler 주기: **1분 유지 가능**
+- `stale_seconds`: **600 or higher recommended**
+- `stale_confirmations`: **3 or higher recommended**
+- scheduler interval: **1 minute is fine**
 
-이유:
+Why:
 
-- 프로세스가 정말 죽으면 `alive=False` 판정으로 즉시 `start`가 걸리므로, `stale_seconds`를 크게 잡아도 복구는 느려지지 않습니다.
-- 반대로 stale 기준이 너무 작으면, 일시적인 상태 파일 정체나 플랫폼 흔들림 때문에 CPR이 건강한 게이트웨이를 건드릴 가능성이 커집니다.
-- 현재 패치는 `running + connected`, `running + active_agents>0`, `running + no telemetry`를 보호하지만, 운영 기본값도 보수적으로 두는 편이 전체 시스템 안정성에 맞습니다.
+- if the process is actually dead, HERMES_CPR reacts via `alive=False` and starts it immediately
+- a larger stale threshold does **not** materially slow dead-process recovery
+- a too-small stale threshold increases the chance of disturbing a healthy-but-quiet gateway
 
-## 1회 실행
+---
 
-```bash
-python3 hermes_cpr.py --config config.json
-```
+## Platform install
 
-윈도우:
+### macOS (launchd)
 
-```powershell
-py -3 .\hermes_cpr.py --config .\config.json
-```
-
-## 테스트
-
-```bash
-python3 -m unittest discover -s tests -q
-```
-
-## macOS launchd 등록
-
-1분마다 돌리려면:
+Install a launch agent that runs every minute:
 
 ```bash
 zsh install_macos_launchd.sh 1
 ```
 
-이 스크립트는 다음을 만듭니다.
+This creates:
 
 - `~/Library/LaunchAgents/ai.hermes.cpr.plist`
-- 로그 파일
 
-## 윈도우 작업 스케줄러 등록
+### Linux (systemd)
 
-1분마다 돌리려면:
+A sample unit file is included at:
+
+- `systemd/hermes-cpr.service`
+- `systemd/hermes-cpr.timer`
+
+Before enabling the timer, **edit the service file** so that:
+
+- `WorkingDirectory=` points to your actual clone path
+- `ExecStart=` points to the right Python executable and `config.json`
+
+Example install:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp systemd/hermes-cpr.service ~/.config/systemd/user/
+cp systemd/hermes-cpr.timer ~/.config/systemd/user/
+$EDITOR ~/.config/systemd/user/hermes-cpr.service
+systemctl --user daemon-reload
+systemctl --user enable --now hermes-cpr.timer
+systemctl --user status hermes-cpr.timer
+```
+
+Important note about `systemctl --user`:
+
+- a user timer usually requires the user systemd manager to be running
+- if you want CPR to stay active while logged out, enable lingering for your user or create a system-level unit instead
+- example lingering command: `sudo loginctl enable-linger $USER`
+
+If you prefer cron, a simple 1-minute entry also works:
+
+```cron
+* * * * * cd /path/to/HERMES_CPR && /usr/bin/python3 hermes_cpr.py --config /path/to/HERMES_CPR/config.json
+```
+
+### Windows (Task Scheduler)
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install_windows_task.ps1 -IntervalMinutes 1
 ```
 
-이 스크립트는 `HermesCPR`라는 예약 작업을 만들고, 매분 `hermes_cpr.py`를 실행합니다.
+This creates a scheduled task named `HermesCPR`.
 
-## 비고
+---
 
-- 이 도구는 Hermes 내부에서 자가 복구하지 않고, 외부에서 CPR만 담당합니다.
-- 재시작 반복을 줄이기 위해 lock 파일과 stale tracker 파일을 사용합니다.
-- macOS는 `launchd`, Windows는 Task Scheduler로 등록해서 자동 실행합니다.
-- 필요하면 이후 단계에서 Discord 알림, 복구 횟수 제한, 다중 프로필 지원도 붙일 수 있습니다.
+## Testing
+
+Run the test suite:
+
+```bash
+python3 -m unittest discover -s tests -q
+```
+
+Optional syntax check:
+
+```bash
+python3 -m py_compile hermes_cpr.py tests/test_hermes_cpr.py
+```
+
+---
+
+## Safety model
+
+The main design goal is:
+
+> revive a dead Hermes gateway without becoming the thing that kills a healthy gateway.
+
+Current protections include:
+
+- no stale restart while a platform is still `connected`
+- no stale restart while `active_agents > 0`
+- no stale restart when no platform telemetry is available
+- no premature `draining` restart before the configured grace period
+- no immediate stale restart; repeated degraded checks are required
+
+---
+
+## Korean summary / 한국어 요약
+
+이 프로젝트는 **이미 운영 중인 Hermes gateway**를 위한 외부 CPR/watchdog 도구입니다.
+
+핵심 원칙:
+
+- 프로세스가 진짜 죽었을 때 살린다
+- 건강한 `running` gateway를 stale만으로 흔들지 않는다
+- `connected` 플랫폼이 있거나, active agent가 남아 있으면 stale restart를 하지 않는다
+- degraded stale 상태는 연속 확인 후에만 재시작한다
+
+즉, **"죽었을 때 살리는 장치"** 에 가깝게 설계되어 있습니다.
+
+---
+
+## Repository contents
+
+- `hermes_cpr.py` — main CPR logic
+- `config.example.json` — example config template
+- `install_macos_launchd.sh` — macOS launchd installer
+- `install_windows_task.ps1` — Windows Task Scheduler installer
+- `systemd/hermes-cpr.service` — sample Linux systemd service unit
+- `systemd/hermes-cpr.timer` — sample Linux systemd timer unit
+- `tests/test_hermes_cpr.py` — unit tests
+
+---
+
+## Notes
+
+- `config.json` is intentionally ignored by git.
+- This repo stores no runtime secrets by default.
+- If your Hermes deployment layout differs, adjust `config.json` and/or `resolve_hermes_bin()`.
+- Future improvements could include notifications, bounded recovery counts, and multi-profile orchestration.

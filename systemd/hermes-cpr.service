@@ -1,0 +1,11 @@
+[Unit]
+Description=Hermes CPR watchdog runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Edit these two paths for your machine before enabling the timer.
+# Example clone path: /home/your-user/HERMES_CPR
+WorkingDirectory=%h/HERMES_CPR
+ExecStart=/usr/bin/env python3 %h/HERMES_CPR/hermes_cpr.py --config %h/HERMES_CPR/config.json
