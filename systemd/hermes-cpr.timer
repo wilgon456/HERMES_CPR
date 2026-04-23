@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Hermes CPR every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Unit=hermes-cpr.service
+
+[Install]
+WantedBy=timers.target
