@@ -19,6 +19,7 @@
 
 - **프로세스 생존**이 최우선 신호입니다.
 - `running` 상태에서는 **플랫폼 상태가 실제로 망가졌는지** 함께 봅니다.
+- **active agent가 남아 있으면** stale restart를 하지 않습니다.
 - stale만으로는 바로 재시작하지 않고, **연속 N회 확인**된 경우에만 재시작합니다.
 - 플랫폼 telemetry가 없거나, 하나라도 `connected`면 stale restart를 하지 않습니다.
 
@@ -55,7 +56,7 @@
   "repo_root": "/Users/you/hermes-agent",
   "hermes_home": "/Users/you/.hermes/profiles/main",
   "profile": "main",
-  "stale_seconds": 300,
+  "stale_seconds": 600,
   "draining_stuck_seconds": 600,
   "stale_confirmations": 3,
   "log_file": "/Users/you/.hermes/profiles/main/logs/hermes-cpr.log",
@@ -69,6 +70,20 @@
 - `draining_stuck_seconds`: `draining` 고착 판정 시간
 - `stale_confirmations`: stale + degraded 상태가 몇 번 연속 확인돼야 재시작할지
 - `tracker_file`: 연속 stale 확인 횟수를 저장하는 파일
+
+## 권장 운영값
+
+Hermes를 **살리는 것**이 목적이라면, 아래처럼 보수적으로 두는 편이 안전합니다.
+
+- `stale_seconds`: **600 이상 권장**
+- `stale_confirmations`: **3 이상 권장**
+- launchd/Task Scheduler 주기: **1분 유지 가능**
+
+이유:
+
+- 프로세스가 정말 죽으면 `alive=False` 판정으로 즉시 `start`가 걸리므로, `stale_seconds`를 크게 잡아도 복구는 느려지지 않습니다.
+- 반대로 stale 기준이 너무 작으면, 일시적인 상태 파일 정체나 플랫폼 흔들림 때문에 CPR이 건강한 게이트웨이를 건드릴 가능성이 커집니다.
+- 현재 패치는 `running + connected`, `running + active_agents>0`, `running + no telemetry`를 보호하지만, 운영 기본값도 보수적으로 두는 편이 전체 시스템 안정성에 맞습니다.
 
 ## 1회 실행
 
