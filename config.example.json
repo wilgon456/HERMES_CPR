@@ -4,5 +4,7 @@
   "profile": "main",
   "stale_seconds": 300,
   "draining_stuck_seconds": 600,
-  "log_file": "/Users/you/.hermes/profiles/main/logs/hermes-cpr.log"
+  "stale_confirmations": 3,
+  "log_file": "/Users/you/.hermes/profiles/main/logs/hermes-cpr.log",
+  "tracker_file": "/Users/you/.hermes/profiles/main/logs/hermes-cpr-state.json"
 }

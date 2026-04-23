@@ -6,9 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import signal
 import subprocess
-import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,8 +15,12 @@ from typing import Any
 
 DEFAULT_STALE_SECONDS = 300
 DEFAULT_DRAINING_STUCK_SECONDS = 600
+DEFAULT_STALE_CONFIRMATIONS = 3
 DEFAULT_PROFILE = "main"
 LOCK_DIR_NAME = "hermes-cpr.lock.d"
+STALE_TRACKER_FILE = "hermes-cpr-state.json"
+CONNECTED_STATES = {"connected"}
+DEGRADED_PLATFORM_STATES = {"disconnected", "fatal", "startup_failed", "error"}
 
 
 @dataclass
@@ -28,7 +30,16 @@ class Config:
     profile: str
     stale_seconds: int
     draining_stuck_seconds: int
+    stale_confirmations: int
     log_file: Path
+    tracker_file: Path
+
+
+@dataclass
+class StaleDecision:
+    should_track: bool
+    restart_allowed: bool
+    reason: str
 
 
 def utc_now() -> datetime:
@@ -39,6 +50,7 @@ def load_config(path: Path) -> Config:
     raw = json.loads(path.read_text(encoding="utf-8"))
     hermes_home = Path(raw["hermes_home"]).expanduser().resolve()
     default_log = hermes_home / "logs" / "hermes-cpr.log"
+    default_tracker = hermes_home / "logs" / STALE_TRACKER_FILE
     return Config(
         repo_root=Path(raw["repo_root"]).expanduser().resolve(),
         hermes_home=hermes_home,
@@ -47,7 +59,11 @@ def load_config(path: Path) -> Config:
         draining_stuck_seconds=int(
             raw.get("draining_stuck_seconds", DEFAULT_DRAINING_STUCK_SECONDS)
         ),
+        stale_confirmations=max(
+            1, int(raw.get("stale_confirmations", DEFAULT_STALE_CONFIRMATIONS))
+        ),
         log_file=Path(raw.get("log_file", default_log)).expanduser().resolve(),
+        tracker_file=Path(raw.get("tracker_file", default_tracker)).expanduser().resolve(),
     )
 
 
@@ -65,6 +81,11 @@ def read_json(path: Path) -> dict[str, Any] | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def process_alive(pid: int | None) -> bool:
@@ -157,6 +178,119 @@ def recover_restart(config: Config, reason: str) -> int:
     return proc.returncode
 
 
+def extract_platform_states(state: dict[str, Any]) -> dict[str, str]:
+    raw_platforms = state.get("platforms")
+    if not isinstance(raw_platforms, dict):
+        return {}
+
+    result: dict[str, str] = {}
+    for name, payload in raw_platforms.items():
+        if not isinstance(payload, dict):
+            continue
+        raw_state = payload.get("state")
+        if not isinstance(raw_state, str):
+            continue
+        normalized = raw_state.strip().lower()
+        if normalized:
+            result[str(name)] = normalized
+    return result
+
+
+def evaluate_stale_decision(state: dict[str, Any], age: int | None, config: Config) -> StaleDecision:
+    if age is None or age <= config.stale_seconds:
+        return StaleDecision(False, False, "runtime status fresh")
+
+    gateway_state = str(state.get("gateway_state", "")).strip().lower() or "unknown"
+    platform_states = extract_platform_states(state)
+
+    if gateway_state == "draining":
+        if age <= config.draining_stuck_seconds:
+            return StaleDecision(
+                False,
+                False,
+                "gateway is draining within the allowed grace period",
+            )
+        return StaleDecision(
+            True,
+            True,
+            "gateway draining state remains stale past the allowed grace period",
+        )
+
+    if gateway_state == "running":
+        if any(value in CONNECTED_STATES for value in platform_states.values()):
+            return StaleDecision(
+                False,
+                False,
+                "runtime status stale but a platform is still connected",
+            )
+
+        if not platform_states:
+            return StaleDecision(
+                False,
+                False,
+                "runtime status stale but no platform telemetry is available",
+            )
+
+        degraded = all(value in DEGRADED_PLATFORM_STATES for value in platform_states.values())
+        if degraded:
+            details = ", ".join(f"{name}={value}" for name, value in sorted(platform_states.items()))
+            return StaleDecision(
+                True,
+                True,
+                f"running state is stale and all platform states are degraded ({details})",
+            )
+
+        details = ", ".join(f"{name}={value}" for name, value in sorted(platform_states.items()))
+        return StaleDecision(
+            False,
+            False,
+            f"runtime status stale but platform states are mixed ({details})",
+        )
+
+    return StaleDecision(
+        True,
+        True,
+        f"gateway state '{gateway_state}' has stale runtime status",
+    )
+
+
+def clear_stale_tracker(config: Config) -> None:
+    try:
+        config.tracker_file.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def bump_stale_tracker(config: Config, state: dict[str, Any], *, age: int, reason: str) -> int:
+    current_pid = state.get("pid")
+    current_updated_at = state.get("updated_at")
+    payload = read_json(config.tracker_file) or {}
+
+    same_sample = (
+        payload.get("pid") == current_pid
+        and payload.get("updated_at") == current_updated_at
+        and payload.get("reason") == reason
+    )
+    try:
+        previous_count = int(payload.get("count", 0))
+    except (TypeError, ValueError):
+        previous_count = 0
+    count = previous_count + 1 if same_sample else 1
+
+    write_json(
+        config.tracker_file,
+        {
+            "pid": current_pid,
+            "updated_at": current_updated_at,
+            "reason": reason,
+            "age": age,
+            "count": count,
+            "recorded_at": utc_now().isoformat(),
+        },
+    )
+    return count
+
+
 def decide_and_recover(config: Config) -> int:
     state_path = config.hermes_home / "gateway_state.json"
     pid_path = config.hermes_home / "gateway.pid"
@@ -183,18 +317,37 @@ def decide_and_recover(config: Config) -> int:
     )
 
     if not alive:
+        clear_stale_tracker(config)
         return recover_start(config, "gateway process missing")
 
     if gateway_state == "startup_failed":
+        clear_stale_tracker(config)
         return recover_restart(config, "gateway in startup_failed state")
 
     if gateway_state == "draining" and age is not None and age > config.draining_stuck_seconds:
+        clear_stale_tracker(config)
         return recover_restart(config, f"gateway stuck in draining for {age}s")
 
-    if age is not None and age > config.stale_seconds:
-        return recover_restart(config, f"gateway runtime status stale for {age}s")
+    stale_decision = evaluate_stale_decision(state, age, config)
+    if stale_decision.should_track:
+        count = bump_stale_tracker(config, state, age=age or -1, reason=stale_decision.reason)
+        log_line(
+            config.log_file,
+            f"stale tracker {count}/{config.stale_confirmations}: {stale_decision.reason}",
+        )
+        if stale_decision.restart_allowed and count >= config.stale_confirmations:
+            clear_stale_tracker(config)
+            return recover_restart(
+                config,
+                f"confirmed stale runtime status after {count} checks: {stale_decision.reason}",
+            )
+        return 0
 
-    log_line(config.log_file, "gateway looks healthy")
+    clear_stale_tracker(config)
+    if age is not None and age > config.stale_seconds:
+        log_line(config.log_file, stale_decision.reason)
+    else:
+        log_line(config.log_file, "gateway looks healthy")
     return 0
 
 
