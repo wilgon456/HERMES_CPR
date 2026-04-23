@@ -202,6 +202,10 @@ def evaluate_stale_decision(state: dict[str, Any], age: int | None, config: Conf
 
     gateway_state = str(state.get("gateway_state", "")).strip().lower() or "unknown"
     platform_states = extract_platform_states(state)
+    try:
+        active_agents = max(0, int(state.get("active_agents", 0)))
+    except (TypeError, ValueError):
+        active_agents = 0
 
     if gateway_state == "draining":
         if age <= config.draining_stuck_seconds:
@@ -217,6 +221,13 @@ def evaluate_stale_decision(state: dict[str, Any], age: int | None, config: Conf
         )
 
     if gateway_state == "running":
+        if active_agents > 0:
+            return StaleDecision(
+                False,
+                False,
+                f"runtime status stale but {active_agents} active agent(s) are still running",
+            )
+
         if any(value in CONNECTED_STATES for value in platform_states.values()):
             return StaleDecision(
                 False,

@@ -81,6 +81,29 @@ class HermesCPRTests(unittest.TestCase):
         restart.assert_not_called()
         self.assertFalse(self.config.tracker_file.exists())
 
+    def test_running_with_active_agents_skips_stale_restart(self) -> None:
+        self.write_state(
+            {
+                "pid": 123,
+                "gateway_state": "running",
+                "updated_at": "2026-04-23T00:00:00+00:00",
+                "active_agents": 2,
+                "platforms": {"discord": {"state": "disconnected"}},
+            }
+        )
+        self.write_pid(123)
+
+        with (
+            patch("hermes_cpr.seconds_since", return_value=420),
+            patch("hermes_cpr.process_alive", return_value=True),
+            patch("hermes_cpr.recover_restart") as restart,
+        ):
+            rc = hermes_cpr.decide_and_recover(self.config)
+
+        self.assertEqual(rc, 0)
+        restart.assert_not_called()
+        self.assertFalse(self.config.tracker_file.exists())
+
     def test_running_degraded_platforms_require_consecutive_stale_checks(self) -> None:
         state = {
             "pid": 123,
