@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -19,6 +20,8 @@ DEFAULT_STALE_CONFIRMATIONS = 3
 DEFAULT_PROFILE = "main"
 LOCK_DIR_NAME = "hermes-cpr.lock.d"
 STALE_TRACKER_FILE = "hermes-cpr-state.json"
+LOCK_OWNER_FILE = "owner.json"
+LOCK_STALE_SECONDS = 900
 CONNECTED_STATES = {"connected"}
 DEGRADED_PLATFORM_STATES = {"disconnected", "fatal", "startup_failed", "error"}
 
@@ -46,6 +49,14 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def config_int(raw: dict[str, Any], key: str, default: int, minimum: int) -> int:
+    try:
+        value = int(raw.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+
 def load_config(path: Path) -> Config:
     raw = json.loads(path.read_text(encoding="utf-8"))
     hermes_home = Path(raw["hermes_home"]).expanduser().resolve()
@@ -55,12 +66,12 @@ def load_config(path: Path) -> Config:
         repo_root=Path(raw["repo_root"]).expanduser().resolve(),
         hermes_home=hermes_home,
         profile=str(raw.get("profile", DEFAULT_PROFILE)).strip() or DEFAULT_PROFILE,
-        stale_seconds=int(raw.get("stale_seconds", DEFAULT_STALE_SECONDS)),
-        draining_stuck_seconds=int(
-            raw.get("draining_stuck_seconds", DEFAULT_DRAINING_STUCK_SECONDS)
+        stale_seconds=config_int(raw, "stale_seconds", DEFAULT_STALE_SECONDS, 0),
+        draining_stuck_seconds=config_int(
+            raw, "draining_stuck_seconds", DEFAULT_DRAINING_STUCK_SECONDS, 0
         ),
-        stale_confirmations=max(
-            1, int(raw.get("stale_confirmations", DEFAULT_STALE_CONFIRMATIONS))
+        stale_confirmations=config_int(
+            raw, "stale_confirmations", DEFAULT_STALE_CONFIRMATIONS, 1
         ),
         log_file=Path(raw.get("log_file", default_log)).expanduser().resolve(),
         tracker_file=Path(raw.get("tracker_file", default_tracker)).expanduser().resolve(),
@@ -93,6 +104,10 @@ def process_alive(pid: int | None) -> bool:
         return False
     try:
         os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
         return True
     except OSError:
         return False
@@ -141,13 +156,51 @@ def run_hermes(config: Config, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def write_lock_owner(lock_dir: Path) -> None:
+    write_json(
+        lock_dir / LOCK_OWNER_FILE,
+        {
+            "pid": os.getpid(),
+            "created_at": utc_now().isoformat(),
+        },
+    )
+
+
+def lock_is_stale(lock_dir: Path) -> bool:
+    owner = read_json(lock_dir / LOCK_OWNER_FILE) or {}
+    created_at = parse_iso(owner.get("created_at"))
+    try:
+        owner_pid = int(owner.get("pid", 0))
+    except (TypeError, ValueError):
+        owner_pid = 0
+
+    if owner_pid > 0 and process_alive(owner_pid):
+        return False
+
+    if created_at is None:
+        return True
+
+    return (utc_now() - created_at).total_seconds() > LOCK_STALE_SECONDS
+
+
 def acquire_lock(config: Config) -> Path | None:
     lock_dir = config.hermes_home / "logs" / LOCK_DIR_NAME
     try:
         lock_dir.mkdir(parents=True, exist_ok=False)
+        write_lock_owner(lock_dir)
     except FileExistsError:
-        log_line(config.log_file, "another CPR instance is already running, skipping")
-        return None
+        if not lock_is_stale(lock_dir):
+            log_line(config.log_file, "another CPR instance is already running, skipping")
+            return None
+
+        log_line(config.log_file, "stale CPR lock found, removing it")
+        try:
+            shutil.rmtree(lock_dir)
+            lock_dir.mkdir(parents=True, exist_ok=False)
+            write_lock_owner(lock_dir)
+        except OSError:
+            log_line(config.log_file, "failed to replace stale CPR lock, skipping")
+            return None
     return lock_dir
 
 
@@ -155,6 +208,7 @@ def release_lock(lock_dir: Path | None) -> None:
     if lock_dir is None:
         return
     try:
+        (lock_dir / LOCK_OWNER_FILE).unlink(missing_ok=True)
         lock_dir.rmdir()
     except OSError:
         pass
@@ -259,9 +313,9 @@ def evaluate_stale_decision(state: dict[str, Any], age: int | None, config: Conf
         )
 
     return StaleDecision(
-        True,
-        True,
-        f"gateway state '{gateway_state}' has stale runtime status",
+        False,
+        False,
+        f"runtime status stale but gateway state '{gateway_state}' is not a restart signal",
     )
 
 
@@ -302,6 +356,28 @@ def bump_stale_tracker(config: Config, state: dict[str, Any], *, age: int, reaso
     return count
 
 
+def parse_pid(raw: Any) -> int | None:
+    try:
+        pid = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def resolve_gateway_pid(state: dict[str, Any], pid_record: dict[str, Any]) -> tuple[int | None, bool]:
+    candidates = [
+        parse_pid(state.get("pid")),
+        parse_pid(pid_record.get("pid")),
+    ]
+    candidates = [pid for pid in candidates if pid is not None]
+
+    for pid in candidates:
+        if process_alive(pid):
+            return pid, True
+
+    return (candidates[0], False) if candidates else (None, False)
+
+
 def decide_and_recover(config: Config) -> int:
     state_path = config.hermes_home / "gateway_state.json"
     pid_path = config.hermes_home / "gateway.pid"
@@ -309,16 +385,8 @@ def decide_and_recover(config: Config) -> int:
     state = read_json(state_path) or {}
     pid_record = read_json(pid_path) or {}
 
-    pid = None
-    for candidate in (state.get("pid"), pid_record.get("pid")):
-        try:
-            pid = int(candidate)
-            break
-        except (TypeError, ValueError):
-            continue
-
-    alive = process_alive(pid)
-    gateway_state = str(state.get("gateway_state", "")).strip()
+    pid, alive = resolve_gateway_pid(state, pid_record)
+    gateway_state = str(state.get("gateway_state", "")).strip().lower()
     age = seconds_since(state.get("updated_at"))
 
     log_line(
@@ -334,10 +402,6 @@ def decide_and_recover(config: Config) -> int:
     if gateway_state == "startup_failed":
         clear_stale_tracker(config)
         return recover_restart(config, "gateway in startup_failed state")
-
-    if gateway_state == "draining" and age is not None and age > config.draining_stuck_seconds:
-        clear_stale_tracker(config)
-        return recover_restart(config, f"gateway stuck in draining for {age}s")
 
     stale_decision = evaluate_stale_decision(state, age, config)
     if stale_decision.should_track:
