@@ -18,12 +18,12 @@ DEFAULT_STALE_SECONDS = 300
 DEFAULT_DRAINING_STUCK_SECONDS = 600
 DEFAULT_STALE_CONFIRMATIONS = 3
 DEFAULT_PROFILE = "main"
+DEFAULT_LAUNCHD_LABEL = "ai.hermes.gateway-main"
+DEFAULT_LAUNCHD_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{DEFAULT_LAUNCHD_LABEL}.plist"
 LOCK_DIR_NAME = "hermes-cpr.lock.d"
 STALE_TRACKER_FILE = "hermes-cpr-state.json"
 LOCK_OWNER_FILE = "owner.json"
 LOCK_STALE_SECONDS = 900
-CONNECTED_STATES = {"connected"}
-DEGRADED_PLATFORM_STATES = {"disconnected", "fatal", "startup_failed", "error"}
 
 
 @dataclass
@@ -36,6 +36,8 @@ class Config:
     stale_confirmations: int
     log_file: Path
     tracker_file: Path
+    launchd_label: str
+    launchd_plist: Path
 
 
 @dataclass
@@ -75,6 +77,11 @@ def load_config(path: Path) -> Config:
         ),
         log_file=Path(raw.get("log_file", default_log)).expanduser().resolve(),
         tracker_file=Path(raw.get("tracker_file", default_tracker)).expanduser().resolve(),
+        launchd_label=str(raw.get("launchd_label", DEFAULT_LAUNCHD_LABEL)).strip()
+        or DEFAULT_LAUNCHD_LABEL,
+        launchd_plist=Path(raw.get("launchd_plist", DEFAULT_LAUNCHD_PLIST))
+        .expanduser()
+        .resolve(),
     )
 
 
@@ -132,23 +139,64 @@ def seconds_since(raw: Any) -> int | None:
     return max(0, int((utc_now() - value).total_seconds()))
 
 
-def resolve_hermes_bin(repo_root: Path) -> str:
-    windows = os.name == "nt"
-    candidates = [
-        repo_root / "venv" / ("Scripts" if windows else "bin") / ("hermes.exe" if windows else "hermes"),
-        repo_root / ".venv" / ("Scripts" if windows else "bin") / ("hermes.exe" if windows else "hermes"),
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate)
-    raise FileNotFoundError("Could not find Hermes executable in venv/ or .venv/")
+def runtime_heartbeat_age(state: dict[str, Any]) -> tuple[int | None, bool]:
+    """Return gateway heartbeat age and whether an explicit heartbeat exists."""
+    heartbeat_at = state.get("heartbeat_at")
+    if isinstance(heartbeat_at, str) and heartbeat_at.strip():
+        age = seconds_since(heartbeat_at)
+        if age is not None:
+            return age, True
+    return seconds_since(state.get("updated_at")), False
+
+
+def run_launchctl(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["launchctl", *args],
+        capture_output=True,
+        text=True,
+    )
+
+
+def launchd_service(config: Config) -> str:
+    return f"gui/{os.getuid()}/{config.launchd_label}"
+
+
+def launchd_domain() -> str:
+    return f"gui/{os.getuid()}"
+
+
+def log_completed_process(config: Config, proc: subprocess.CompletedProcess[str]) -> None:
+    output = "\n".join(filter(None, [proc.stdout, proc.stderr])).strip()
+    if output:
+        log_line(config.log_file, output)
+
+
+def launchd_service_loaded(config: Config) -> bool:
+    proc = run_launchctl("print", launchd_service(config))
+    return proc.returncode == 0
+
+
+def bootstrap_launchd_service(config: Config) -> subprocess.CompletedProcess[str]:
+    return run_launchctl("bootstrap", launchd_domain(), str(config.launchd_plist))
+
+
+def kickstart_launchd_service(config: Config) -> subprocess.CompletedProcess[str]:
+    return run_launchctl("kickstart", "-k", launchd_service(config))
 
 
 def run_hermes(config: Config, *args: str) -> subprocess.CompletedProcess[str]:
+    windows = os.name == "nt"
+    candidates = [
+        config.repo_root / "venv" / ("Scripts" if windows else "bin") / ("hermes.exe" if windows else "hermes"),
+        config.repo_root / ".venv" / ("Scripts" if windows else "bin") / ("hermes.exe" if windows else "hermes"),
+    ]
+    hermes_bin = next((str(candidate) for candidate in candidates if candidate.exists()), None)
+    if hermes_bin is None:
+        raise FileNotFoundError("Could not find Hermes executable in venv/ or .venv/")
     env = dict(os.environ)
     env["HERMES_HOME"] = str(config.hermes_home)
     return subprocess.run(
-        [resolve_hermes_bin(config.repo_root), "--profile", config.profile, *args],
+        [hermes_bin, "--profile", config.profile, *args],
         cwd=config.repo_root,
         capture_output=True,
         text=True,
@@ -216,19 +264,21 @@ def release_lock(lock_dir: Path | None) -> None:
 
 def recover_start(config: Config, reason: str) -> int:
     log_line(config.log_file, f"start requested: {reason}")
-    proc = run_hermes(config, "gateway", "start")
-    output = "\n".join(filter(None, [proc.stdout, proc.stderr])).strip()
-    if output:
-        log_line(config.log_file, output)
+    if launchd_service_loaded(config):
+        proc = kickstart_launchd_service(config)
+    else:
+        proc = bootstrap_launchd_service(config)
+    log_completed_process(config, proc)
     return proc.returncode
 
 
 def recover_restart(config: Config, reason: str) -> int:
     log_line(config.log_file, f"restart requested: {reason}")
-    proc = run_hermes(config, "gateway", "restart")
-    output = "\n".join(filter(None, [proc.stdout, proc.stderr])).strip()
-    if output:
-        log_line(config.log_file, output)
+    proc = kickstart_launchd_service(config)
+    if proc.returncode != 0 and not launchd_service_loaded(config):
+        log_completed_process(config, proc)
+        proc = bootstrap_launchd_service(config)
+    log_completed_process(config, proc)
     return proc.returncode
 
 
@@ -250,7 +300,13 @@ def extract_platform_states(state: dict[str, Any]) -> dict[str, str]:
     return result
 
 
-def evaluate_stale_decision(state: dict[str, Any], age: int | None, config: Config) -> StaleDecision:
+def evaluate_stale_decision(
+    state: dict[str, Any],
+    age: int | None,
+    config: Config,
+    *,
+    explicit_heartbeat: bool,
+) -> StaleDecision:
     if age is None or age <= config.stale_seconds:
         return StaleDecision(False, False, "runtime status fresh")
 
@@ -275,41 +331,47 @@ def evaluate_stale_decision(state: dict[str, Any], age: int | None, config: Conf
         )
 
     if gateway_state == "running":
+        if not explicit_heartbeat:
+            if active_agents > 0:
+                return StaleDecision(
+                    False,
+                    False,
+                    f"legacy runtime status is stale but active_agents={active_agents}; waiting for explicit heartbeat telemetry",
+                )
+            live_platform_states = {
+                name: value
+                for name, value in platform_states.items()
+                if value in {"connected", "connecting", "retrying"}
+            }
+            if live_platform_states:
+                details = ", ".join(
+                    f"{name}={value}" for name, value in sorted(live_platform_states.items())
+                )
+                return StaleDecision(
+                    False,
+                    False,
+                    f"legacy runtime status is stale but platform telemetry exists ({details}); waiting for explicit heartbeat telemetry",
+                )
+
         if active_agents > 0:
             return StaleDecision(
-                False,
-                False,
-                f"runtime status stale but {active_agents} active agent(s) are still running",
+                True,
+                True,
+                f"explicit gateway heartbeat is stale; active_agents={active_agents}",
             )
 
-        if any(value in CONNECTED_STATES for value in platform_states.values()):
-            return StaleDecision(
-                False,
-                False,
-                "runtime status stale but a platform is still connected",
-            )
-
-        if not platform_states:
-            return StaleDecision(
-                False,
-                False,
-                "runtime status stale but no platform telemetry is available",
-            )
-
-        degraded = all(value in DEGRADED_PLATFORM_STATES for value in platform_states.values())
-        if degraded:
+        if platform_states:
             details = ", ".join(f"{name}={value}" for name, value in sorted(platform_states.items()))
             return StaleDecision(
                 True,
                 True,
-                f"running state is stale and all platform states are degraded ({details})",
+                f"explicit gateway heartbeat is stale; platform states were {details}",
             )
 
-        details = ", ".join(f"{name}={value}" for name, value in sorted(platform_states.items()))
         return StaleDecision(
-            False,
-            False,
-            f"runtime status stale but platform states are mixed ({details})",
+            True,
+            True,
+            "explicit gateway heartbeat is stale and no platform telemetry is available",
         )
 
     return StaleDecision(
@@ -387,12 +449,13 @@ def decide_and_recover(config: Config) -> int:
 
     pid, alive = resolve_gateway_pid(state, pid_record)
     gateway_state = str(state.get("gateway_state", "")).strip().lower()
-    age = seconds_since(state.get("updated_at"))
+    age, explicit_heartbeat = runtime_heartbeat_age(state)
 
     log_line(
         config.log_file,
         f"check pid={pid or 'none'} alive={alive} state={gateway_state or 'unknown'} "
-        f"updated_age={age if age is not None else 'unknown'}s",
+        f"heartbeat_age={age if age is not None else 'unknown'}s "
+        f"heartbeat={'explicit' if explicit_heartbeat else 'legacy'}",
     )
 
     if not alive:
@@ -403,7 +466,12 @@ def decide_and_recover(config: Config) -> int:
         clear_stale_tracker(config)
         return recover_restart(config, "gateway in startup_failed state")
 
-    stale_decision = evaluate_stale_decision(state, age, config)
+    stale_decision = evaluate_stale_decision(
+        state,
+        age,
+        config,
+        explicit_heartbeat=explicit_heartbeat,
+    )
     if stale_decision.should_track:
         count = bump_stale_tracker(config, state, age=age or -1, reason=stale_decision.reason)
         log_line(

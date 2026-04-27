@@ -5,7 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import hermes_cpr
 
@@ -25,6 +25,8 @@ class HermesCPRTests(unittest.TestCase):
             stale_confirmations=3,
             log_file=self.hermes_home / "logs" / "hermes-cpr.log",
             tracker_file=self.hermes_home / "logs" / "hermes-cpr-state.json",
+            launchd_label="ai.hermes.gateway-main",
+            launchd_plist=self.root / "ai.hermes.gateway-main.plist",
         )
 
     def tearDown(self) -> None:
@@ -36,7 +38,7 @@ class HermesCPRTests(unittest.TestCase):
     def write_pid(self, pid: int) -> None:
         (self.hermes_home / "gateway.pid").write_text(json.dumps({"pid": pid}), encoding="utf-8")
 
-    def test_running_connected_platform_skips_stale_restart(self) -> None:
+    def test_legacy_running_connected_platform_does_not_restart(self) -> None:
         self.write_state(
             {
                 "pid": 123,
@@ -50,17 +52,47 @@ class HermesCPRTests(unittest.TestCase):
         with (
             patch("hermes_cpr.seconds_since", return_value=360),
             patch("hermes_cpr.process_alive", return_value=True),
-            patch("hermes_cpr.recover_restart") as restart,
+            patch("hermes_cpr.recover_restart", return_value=0) as restart,
             patch("hermes_cpr.recover_start") as start,
         ):
-            rc = hermes_cpr.decide_and_recover(self.config)
+            rc1 = hermes_cpr.decide_and_recover(self.config)
+            rc2 = hermes_cpr.decide_and_recover(self.config)
+            rc3 = hermes_cpr.decide_and_recover(self.config)
 
-        self.assertEqual(rc, 0)
+        self.assertEqual((rc1, rc2, rc3), (0, 0, 0))
         start.assert_not_called()
         restart.assert_not_called()
         self.assertFalse(self.config.tracker_file.exists())
 
-    def test_running_without_platform_telemetry_skips_stale_restart(self) -> None:
+    def test_explicit_stale_heartbeat_requires_consecutive_checks(self) -> None:
+        self.write_state(
+            {
+                "pid": 123,
+                "gateway_state": "running",
+                "heartbeat_at": "2026-04-23T00:00:00+00:00",
+                "updated_at": "2026-04-23T00:00:00+00:00",
+                "platforms": {"discord": {"state": "connected"}},
+            }
+        )
+        self.write_pid(123)
+
+        with (
+            patch("hermes_cpr.seconds_since", return_value=360),
+            patch("hermes_cpr.process_alive", return_value=True),
+            patch("hermes_cpr.recover_restart", return_value=0) as restart,
+            patch("hermes_cpr.recover_start") as start,
+        ):
+            rc1 = hermes_cpr.decide_and_recover(self.config)
+            rc2 = hermes_cpr.decide_and_recover(self.config)
+            rc3 = hermes_cpr.decide_and_recover(self.config)
+
+        self.assertEqual((rc1, rc2, rc3), (0, 0, 0))
+        start.assert_not_called()
+        self.assertEqual(restart.call_count, 1)
+        self.assertIn("confirmed stale runtime status after 3 checks", restart.call_args.args[1])
+        self.assertFalse(self.config.tracker_file.exists())
+
+    def test_running_without_platform_telemetry_tracks_stale_restart(self) -> None:
         self.write_state(
             {
                 "pid": 123,
@@ -80,9 +112,9 @@ class HermesCPRTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         restart.assert_not_called()
-        self.assertFalse(self.config.tracker_file.exists())
+        self.assertTrue(self.config.tracker_file.exists())
 
-    def test_running_with_active_agents_skips_stale_restart(self) -> None:
+    def test_legacy_running_with_active_agents_does_not_restart(self) -> None:
         self.write_state(
             {
                 "pid": 123,
@@ -263,6 +295,38 @@ class HermesCPRTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         restart.assert_called_once_with(self.config, "gateway in startup_failed state")
+
+    def test_recover_restart_uses_launchctl_kickstart(self) -> None:
+        with patch("hermes_cpr.run_launchctl") as run_launchctl:
+            run_launchctl.return_value.returncode = 0
+            run_launchctl.return_value.stdout = ""
+            run_launchctl.return_value.stderr = ""
+
+            rc = hermes_cpr.recover_restart(self.config, "stale heartbeat")
+
+        self.assertEqual(rc, 0)
+        run_launchctl.assert_called_once_with(
+            "kickstart",
+            "-k",
+            f"gui/{os.getuid()}/ai.hermes.gateway-main",
+        )
+
+    def test_recover_start_bootstraps_when_service_is_unloaded(self) -> None:
+        def fake_launchctl(*args: str):
+            proc = Mock()
+            proc.stdout = ""
+            proc.stderr = ""
+            proc.returncode = 113 if args[0] == "print" else 0
+            return proc
+
+        with patch("hermes_cpr.run_launchctl", side_effect=fake_launchctl) as run_launchctl:
+            rc = hermes_cpr.recover_start(self.config, "gateway process missing")
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            run_launchctl.call_args_list[-1].args,
+            ("bootstrap", f"gui/{os.getuid()}", str(self.config.launchd_plist)),
+        )
 
     def test_stale_lock_is_replaced(self) -> None:
         lock_dir = self.hermes_home / "logs" / hermes_cpr.LOCK_DIR_NAME
