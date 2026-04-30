@@ -10,18 +10,18 @@ HERMES_CPR은 독립형 챗봇도 아니고, 임의의 프로세스를 감시하
 
 HERMES_CPR은 Hermes 런타임 파일을 주기적으로 점검하고, 아래 상황에서 복구를 시도합니다.
 
-- Hermes gateway 프로세스가 사라졌을 때 → `hermes gateway start`
-- gateway가 `startup_failed` 상태일 때 → `hermes gateway restart`
-- gateway가 `draining` 상태에서 허용 시간 이상 멈춘 것이 여러 번 연속 확인될 때 → `hermes gateway restart`
-- gateway가 `running` 상태이지만 런타임 상태가 stale이고, **모든 플랫폼 상태가 degraded인 것이 여러 번 연속 확인될 때만** → `hermes gateway restart`
+- Hermes gateway 프로세스가 사라졌을 때 → launchd/systemd를 통해 start/bootstrap
+- gateway가 `startup_failed` 상태일 때 → launchd/systemd를 통해 restart
+- `gateway_watchdog.json` lease가 stale인 것이 여러 번 연속 확인될 때 → launchd/systemd를 통해 restart
+- watchdog lease가 없는 구형 Hermes 배포에서는 `gateway_state.json`, `gateway.pid`, `gateway.lock` 기반 보수적 fallback 사용
 
 이 도구는 일부러 보수적으로 동작합니다.
 
-- **프로세스 생존 여부를 최우선 신호**로 봅니다.
+- `gateway_watchdog.json`이 있으면 **gateway가 직접 갱신한 lease deadline**을 최우선 신호로 봅니다.
+- `gateway.lock`이 있으면 OS file lock 보유 여부로 실제 gateway 생존 여부를 확인합니다.
 - `gateway_state`가 알 수 없는 값이면 재시작 근거로 쓰지 않습니다.
-- 건강한 `running` gateway는 `updated_at`만 멈췄다고 재시작하지 않습니다.
-- `running` 상태에서 연결된 플랫폼이 하나라도 있으면 보호합니다.
-- `running` 상태에서 active agent가 남아 있으면 보호합니다.
+- 구형 fallback에서는 건강한 `running` gateway를 `updated_at`만 멈췄다고 재시작하지 않습니다.
+- 구형 fallback에서는 `running` 상태에서 연결된 플랫폼이나 active agent가 있으면 보호합니다.
 - stale 기반 재시작은 반드시 **반복 확인**을 거쳐야 합니다.
 
 ---
@@ -52,11 +52,13 @@ HERMES_CPR을 설치하기 전에 이미 아래가 준비되어 있어야 합니
 - 다음 런타임 파일을 생성하는 Hermes gateway 배포
   - `gateway_state.json`
   - `gateway.pid`
+  - `gateway.lock` 권장
+  - `gateway_watchdog.json` 권장
 - Hermes CLI 실행 파일이 아래 둘 중 하나에 존재하는 Python 환경
   - `repo_root/venv/bin/hermes`
   - `repo_root/.venv/bin/hermes`
 
-현재 HERMES_CPR은 Hermes 실행 파일이 **repo-local virtualenv** 안에 있다고 가정합니다. 배포 구조가 다르면 `hermes_cpr.py` 안의 `resolve_hermes_bin()`을 환경에 맞게 수정하세요.
+현재 HERMES_CPR은 launchd 기반 macOS 배포에서 Hermes gateway 서비스를 `ai.hermes.gateway-main` label로 관리하는 구성을 기본값으로 둡니다. 배포 구조가 다르면 `config.json`의 `launchd_label`, `launchd_plist` 또는 systemd unit을 환경에 맞게 수정하세요.
 
 ---
 
@@ -85,6 +87,7 @@ cp config.example.json config.json
   "hermes_home": "/home/you/.hermes/profiles/main",
   "profile": "main",
   "stale_seconds": 600,
+  "watchdog_stale_seconds": 60,
   "draining_stuck_seconds": 600,
   "stale_confirmations": 3,
   "log_file": "/home/you/.hermes/profiles/main/logs/hermes-cpr.log",
@@ -118,6 +121,7 @@ python3 hermes_cpr.py --config config.json
   "hermes_home": "/Users/you/.hermes/profiles/main",
   "profile": "main",
   "stale_seconds": 600,
+  "watchdog_stale_seconds": 60,
   "draining_stuck_seconds": 600,
   "stale_confirmations": 3,
   "log_file": "/Users/you/.hermes/profiles/main/logs/hermes-cpr.log",
@@ -130,7 +134,8 @@ python3 hermes_cpr.py --config config.json
 - `repo_root`: `hermes-agent` 체크아웃 경로
 - `hermes_home`: 런타임 파일이 있는 Hermes home/profile 디렉터리
 - `profile`: Hermes CLI에 넘길 profile 이름
-- `stale_seconds`: `updated_at`이 얼마나 오래돼야 stale 판단을 시작할지
+- `watchdog_stale_seconds`: `gateway_watchdog.json` heartbeat가 얼마나 오래돼야 dead/stuck으로 볼지
+- `stale_seconds`: watchdog lease가 없는 구형 fallback에서 `updated_at`이 얼마나 오래돼야 stale 판단을 시작할지
 - `draining_stuck_seconds`: `draining` 상태를 stuck으로 보기 전 grace period
 - `stale_confirmations`: 재시작 가능한 stale 상태가 몇 번 연속 확인돼야 재시작할지
 - `log_file`: CPR 로그 파일 경로
@@ -141,13 +146,15 @@ python3 hermes_cpr.py --config config.json
 목표가 **죽은 Hermes는 살리고, 건강한 Hermes는 흔들지 않는 것**이라면 아래처럼 보수적으로 두는 게 안전합니다.
 
 - `stale_seconds`: **600 이상 권장**
+- `watchdog_stale_seconds`: **60 이상 권장**
 - `stale_confirmations`: **3 이상 권장**
 - 스케줄러 주기: **1분이면 충분**
 
 이유:
 
-- 프로세스가 정말 죽으면 `alive=False`로 즉시 감지해서 `start`를 시도하므로, `stale_seconds`를 크게 잡아도 dead-process 복구는 크게 느려지지 않습니다.
-- 반대로 stale 기준이 너무 작으면, 조용하지만 건강한 gateway를 쓸데없이 흔들 가능성이 커집니다.
+- 프로세스가 정말 죽으면 `gateway.lock`/PID로 감지해서 start를 시도하므로, fallback `stale_seconds`를 크게 잡아도 dead-process 복구는 크게 느려지지 않습니다.
+- watchdog lease는 gateway event loop가 직접 갱신하므로 platform telemetry를 해석하지 않고도 stuck 상태를 감지할 수 있습니다.
+- 반대로 stale 기준이 너무 작으면, 부하가 큰 순간에 건강한 gateway를 쓸데없이 흔들 가능성이 커집니다.
 
 설정값이 비정상인 경우에는 CPR이 지나치게 공격적으로 동작하지 않도록 기본값 또는 최소값으로 보정합니다.
 

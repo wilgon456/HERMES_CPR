@@ -38,6 +38,12 @@ class HermesCPRTests(unittest.TestCase):
     def write_pid(self, pid: int) -> None:
         (self.hermes_home / "gateway.pid").write_text(json.dumps({"pid": pid}), encoding="utf-8")
 
+    def write_watchdog(self, payload: dict) -> None:
+        (self.hermes_home / hermes_cpr.WATCHDOG_LEASE_FILE).write_text(
+            json.dumps(payload),
+            encoding="utf-8",
+        )
+
     def test_legacy_running_connected_platform_does_not_restart(self) -> None:
         self.write_state(
             {
@@ -64,7 +70,7 @@ class HermesCPRTests(unittest.TestCase):
         restart.assert_not_called()
         self.assertFalse(self.config.tracker_file.exists())
 
-    def test_explicit_stale_heartbeat_requires_consecutive_checks(self) -> None:
+    def test_explicit_stale_heartbeat_with_connected_platform_does_not_restart(self) -> None:
         self.write_state(
             {
                 "pid": 123,
@@ -72,6 +78,141 @@ class HermesCPRTests(unittest.TestCase):
                 "heartbeat_at": "2026-04-23T00:00:00+00:00",
                 "updated_at": "2026-04-23T00:00:00+00:00",
                 "platforms": {"discord": {"state": "connected"}},
+            }
+        )
+        self.write_pid(123)
+
+        with (
+            patch("hermes_cpr.seconds_since", return_value=360),
+            patch("hermes_cpr.process_alive", return_value=True),
+            patch("hermes_cpr.recover_restart", return_value=0) as restart,
+            patch("hermes_cpr.recover_start") as start,
+        ):
+            rc1 = hermes_cpr.decide_and_recover(self.config)
+            rc2 = hermes_cpr.decide_and_recover(self.config)
+            rc3 = hermes_cpr.decide_and_recover(self.config)
+
+        self.assertEqual((rc1, rc2, rc3), (0, 0, 0))
+        start.assert_not_called()
+        restart.assert_not_called()
+        self.assertFalse(self.config.tracker_file.exists())
+
+    def test_live_platform_telemetry_clears_existing_stale_tracker(self) -> None:
+        self.write_state(
+            {
+                "pid": 123,
+                "gateway_state": "running",
+                "heartbeat_at": "2026-04-23T00:00:00+00:00",
+                "updated_at": "2026-04-23T00:00:00+00:00",
+                "platforms": {"discord": {"state": "connected"}},
+            }
+        )
+        self.write_pid(123)
+        hermes_cpr.write_json(
+            self.config.tracker_file,
+            {
+                "pid": 123,
+                "updated_at": "2026-04-23T00:00:00+00:00",
+                "reason": "explicit gateway heartbeat is stale",
+                "count": 2,
+            },
+        )
+
+        with (
+            patch("hermes_cpr.seconds_since", return_value=360),
+            patch("hermes_cpr.process_alive", return_value=True),
+            patch("hermes_cpr.recover_restart") as restart,
+            patch("hermes_cpr.recover_start") as start,
+        ):
+            rc = hermes_cpr.decide_and_recover(self.config)
+
+        self.assertEqual(rc, 0)
+        start.assert_not_called()
+        restart.assert_not_called()
+        self.assertFalse(self.config.tracker_file.exists())
+
+    def test_fresh_watchdog_lease_overrides_stale_runtime_status(self) -> None:
+        self.write_state(
+            {
+                "pid": 123,
+                "gateway_state": "running",
+                "heartbeat_at": "2026-04-23T00:00:00+00:00",
+                "updated_at": "2026-04-23T00:00:00+00:00",
+                "platforms": {"discord": {"state": "disconnected"}},
+            }
+        )
+        self.write_pid(123)
+        self.write_watchdog(
+            {
+                "pid": 123,
+                "kind": "hermes-gateway",
+                "state": "running",
+                "heartbeat_at": "fresh-watchdog",
+            }
+        )
+
+        def fake_seconds_since(raw: object) -> int:
+            return 30 if raw == "fresh-watchdog" else 999
+
+        with (
+            patch("hermes_cpr.seconds_since", side_effect=fake_seconds_since),
+            patch("hermes_cpr.process_alive", return_value=True),
+            patch("hermes_cpr.recover_restart") as restart,
+            patch("hermes_cpr.recover_start") as start,
+        ):
+            rc = hermes_cpr.decide_and_recover(self.config)
+
+        self.assertEqual(rc, 0)
+        start.assert_not_called()
+        restart.assert_not_called()
+        self.assertFalse(self.config.tracker_file.exists())
+
+    def test_stale_watchdog_lease_restarts_even_with_connected_platform(self) -> None:
+        self.write_state(
+            {
+                "pid": 123,
+                "gateway_state": "running",
+                "heartbeat_at": "2026-04-23T00:00:00+00:00",
+                "updated_at": "2026-04-23T00:00:00+00:00",
+                "platforms": {"discord": {"state": "connected"}},
+            }
+        )
+        self.write_pid(123)
+        self.write_watchdog(
+            {
+                "pid": 123,
+                "kind": "hermes-gateway",
+                "state": "running",
+                "heartbeat_at": "2026-04-23T00:00:00+00:00",
+            }
+        )
+
+        with (
+            patch("hermes_cpr.seconds_since", return_value=420),
+            patch("hermes_cpr.process_alive", return_value=True),
+            patch("hermes_cpr.recover_restart", return_value=0) as restart,
+            patch("hermes_cpr.recover_start") as start,
+        ):
+            rc1 = hermes_cpr.decide_and_recover(self.config)
+            rc2 = hermes_cpr.decide_and_recover(self.config)
+            rc3 = hermes_cpr.decide_and_recover(self.config)
+
+        self.assertEqual((rc1, rc2, rc3), (0, 0, 0))
+        start.assert_not_called()
+        self.assertEqual(restart.call_count, 1)
+        self.assertIn("gateway watchdog lease is stale", restart.call_args.args[1])
+        self.assertFalse(self.config.tracker_file.exists())
+
+    def test_explicit_stale_heartbeat_with_degraded_platform_requires_consecutive_checks(
+        self,
+    ) -> None:
+        self.write_state(
+            {
+                "pid": 123,
+                "gateway_state": "running",
+                "heartbeat_at": "2026-04-23T00:00:00+00:00",
+                "updated_at": "2026-04-23T00:00:00+00:00",
+                "platforms": {"discord": {"state": "disconnected"}},
             }
         )
         self.write_pid(123)
@@ -277,6 +418,62 @@ class HermesCPRTests(unittest.TestCase):
         start.assert_not_called()
         restart.assert_not_called()
 
+    def test_gateway_lock_is_authoritative_when_active(self) -> None:
+        self.write_state(
+            {
+                "pid": 111,
+                "gateway_state": "running",
+                "updated_at": "2026-04-23T00:00:00+00:00",
+                "platforms": {"discord": {"state": "connected"}},
+            }
+        )
+        self.write_pid(222)
+        hermes_cpr.write_json(
+            self.hermes_home / hermes_cpr.GATEWAY_LOCK_FILE,
+            {"pid": 333, "kind": "hermes-gateway"},
+        )
+
+        with (
+            patch("hermes_cpr.gateway_lock_active", return_value=True),
+            patch("hermes_cpr.process_alive", return_value=False) as process_alive,
+            patch("hermes_cpr.seconds_since", return_value=120),
+            patch("hermes_cpr.recover_start") as start,
+            patch("hermes_cpr.recover_restart") as restart,
+        ):
+            rc = hermes_cpr.decide_and_recover(self.config)
+
+        self.assertEqual(rc, 0)
+        process_alive.assert_not_called()
+        start.assert_not_called()
+        restart.assert_not_called()
+
+    def test_unlocked_gateway_lock_treats_gateway_as_missing(self) -> None:
+        self.write_state(
+            {
+                "pid": 111,
+                "gateway_state": "running",
+                "updated_at": "2026-04-23T00:00:00+00:00",
+            }
+        )
+        self.write_pid(222)
+        hermes_cpr.write_json(
+            self.hermes_home / hermes_cpr.GATEWAY_LOCK_FILE,
+            {"pid": 333, "kind": "hermes-gateway"},
+        )
+
+        with (
+            patch("hermes_cpr.gateway_lock_active", return_value=False),
+            patch("hermes_cpr.process_alive", return_value=True) as process_alive,
+            patch("hermes_cpr.recover_start", return_value=0) as start,
+            patch("hermes_cpr.recover_restart") as restart,
+        ):
+            rc = hermes_cpr.decide_and_recover(self.config)
+
+        self.assertEqual(rc, 0)
+        process_alive.assert_not_called()
+        start.assert_called_once_with(self.config, "gateway process missing")
+        restart.assert_not_called()
+
     def test_startup_failed_state_is_case_insensitive(self) -> None:
         self.write_state(
             {
@@ -387,6 +584,7 @@ class HermesCPRTests(unittest.TestCase):
         self.assertEqual(config.stale_seconds, 0)
         self.assertEqual(config.draining_stuck_seconds, hermes_cpr.DEFAULT_DRAINING_STUCK_SECONDS)
         self.assertEqual(config.stale_confirmations, 1)
+        self.assertEqual(config.watchdog_stale_seconds, 0)
 
 
 if __name__ == "__main__":

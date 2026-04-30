@@ -39,6 +39,7 @@ cat > "$PLIST_PATH" <<PLIST
 PLIST
 
 launchctl bootout "gui/$(id -u)/ai.hermes.cpr" >/dev/null 2>&1 || true
+launchctl enable "gui/$(id -u)/ai.hermes.cpr"
 launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
 launchctl kickstart -k "gui/$(id -u)/ai.hermes.cpr"
 

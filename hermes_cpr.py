@@ -8,10 +8,16 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+if sys.platform == "win32":
+    fcntl = None
+else:
+    import fcntl
 
 
 DEFAULT_STALE_SECONDS = 300
@@ -24,6 +30,8 @@ LOCK_DIR_NAME = "hermes-cpr.lock.d"
 STALE_TRACKER_FILE = "hermes-cpr-state.json"
 LOCK_OWNER_FILE = "owner.json"
 LOCK_STALE_SECONDS = 900
+GATEWAY_LOCK_FILE = "gateway.lock"
+WATCHDOG_LEASE_FILE = "gateway_watchdog.json"
 
 
 @dataclass
@@ -38,6 +46,8 @@ class Config:
     tracker_file: Path
     launchd_label: str
     launchd_plist: Path
+    watchdog_file: Path | None = None
+    watchdog_stale_seconds: int = DEFAULT_STALE_SECONDS
 
 
 @dataclass
@@ -45,6 +55,13 @@ class StaleDecision:
     should_track: bool
     restart_allowed: bool
     reason: str
+
+
+@dataclass
+class GatewayPresence:
+    pid: int | None
+    alive: bool
+    source: str
 
 
 def utc_now() -> datetime:
@@ -64,6 +81,7 @@ def load_config(path: Path) -> Config:
     hermes_home = Path(raw["hermes_home"]).expanduser().resolve()
     default_log = hermes_home / "logs" / "hermes-cpr.log"
     default_tracker = hermes_home / "logs" / STALE_TRACKER_FILE
+    default_watchdog = hermes_home / WATCHDOG_LEASE_FILE
     return Config(
         repo_root=Path(raw["repo_root"]).expanduser().resolve(),
         hermes_home=hermes_home,
@@ -82,6 +100,13 @@ def load_config(path: Path) -> Config:
         launchd_plist=Path(raw.get("launchd_plist", DEFAULT_LAUNCHD_PLIST))
         .expanduser()
         .resolve(),
+        watchdog_file=Path(raw.get("watchdog_file", default_watchdog)).expanduser().resolve(),
+        watchdog_stale_seconds=config_int(
+            raw,
+            "watchdog_stale_seconds",
+            config_int(raw, "stale_seconds", DEFAULT_STALE_SECONDS, 0),
+            0,
+        ),
     )
 
 
@@ -118,6 +143,36 @@ def process_alive(pid: int | None) -> bool:
         return True
     except OSError:
         return False
+
+
+def gateway_lock_active(lock_path: Path) -> bool | None:
+    """Return whether Hermes' runtime lock is held by a live gateway process."""
+    if fcntl is None or not lock_path.exists():
+        return None
+
+    try:
+        handle = lock_path.open("a+", encoding="utf-8")
+    except OSError:
+        return None
+
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return None
+
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        return False
+    finally:
+        try:
+            handle.close()
+        except OSError:
+            pass
 
 
 def parse_iso(raw: Any) -> datetime | None:
@@ -331,33 +386,34 @@ def evaluate_stale_decision(
         )
 
     if gateway_state == "running":
-        if not explicit_heartbeat:
-            if active_agents > 0:
-                return StaleDecision(
-                    False,
-                    False,
-                    f"legacy runtime status is stale but active_agents={active_agents}; waiting for explicit heartbeat telemetry",
-                )
-            live_platform_states = {
-                name: value
-                for name, value in platform_states.items()
-                if value in {"connected", "connecting", "retrying"}
-            }
-            if live_platform_states:
-                details = ", ".join(
-                    f"{name}={value}" for name, value in sorted(live_platform_states.items())
-                )
-                return StaleDecision(
-                    False,
-                    False,
-                    f"legacy runtime status is stale but platform telemetry exists ({details}); waiting for explicit heartbeat telemetry",
-                )
-
         if active_agents > 0:
+            return StaleDecision(
+                False,
+                False,
+                f"runtime status is stale but active_agents={active_agents}; refusing to restart a live gateway",
+            )
+
+        live_platform_states = {
+            name: value
+            for name, value in platform_states.items()
+            if value in {"connected", "connecting", "retrying"}
+        }
+        if live_platform_states:
+            details = ", ".join(
+                f"{name}={value}" for name, value in sorted(live_platform_states.items())
+            )
+            heartbeat_label = "explicit gateway heartbeat" if explicit_heartbeat else "legacy runtime status"
+            return StaleDecision(
+                False,
+                False,
+                f"{heartbeat_label} is stale but live platform telemetry exists ({details}); refusing to restart a live gateway",
+            )
+
+        if not explicit_heartbeat:
             return StaleDecision(
                 True,
                 True,
-                f"explicit gateway heartbeat is stale; active_agents={active_agents}",
+                "legacy runtime status is stale and no live platform telemetry is available",
             )
 
         if platform_states:
@@ -418,6 +474,36 @@ def bump_stale_tracker(config: Config, state: dict[str, Any], *, age: int, reaso
     return count
 
 
+def watchdog_file(config: Config) -> Path:
+    return config.watchdog_file or config.hermes_home / WATCHDOG_LEASE_FILE
+
+
+def watchdog_lease_age(config: Config) -> tuple[dict[str, Any] | None, int | None]:
+    lease = read_json(watchdog_file(config))
+    if lease is None:
+        return None, None
+    return lease, seconds_since(lease.get("heartbeat_at"))
+
+
+def format_age(age: int | None) -> str:
+    return f"{age}s" if age is not None else "missing"
+
+
+def track_and_maybe_restart(config: Config, sample: dict[str, Any], age: int, reason: str) -> int:
+    count = bump_stale_tracker(config, sample, age=age, reason=reason)
+    log_line(
+        config.log_file,
+        f"stale tracker {count}/{config.stale_confirmations}: {reason}",
+    )
+    if count >= config.stale_confirmations:
+        clear_stale_tracker(config)
+        return recover_restart(
+            config,
+            f"confirmed stale runtime status after {count} checks: {reason}",
+        )
+    return 0
+
+
 def parse_pid(raw: Any) -> int | None:
     try:
         pid = int(raw)
@@ -426,18 +512,30 @@ def parse_pid(raw: Any) -> int | None:
     return pid if pid > 0 else None
 
 
-def resolve_gateway_pid(state: dict[str, Any], pid_record: dict[str, Any]) -> tuple[int | None, bool]:
+def resolve_gateway_presence(
+    config: Config,
+    state: dict[str, Any],
+    pid_record: dict[str, Any],
+) -> GatewayPresence:
+    lock_path = config.hermes_home / GATEWAY_LOCK_FILE
+    lock_record = read_json(lock_path) or {}
+    lock_state = gateway_lock_active(lock_path)
+
     candidates = [
+        parse_pid(lock_record.get("pid")),
         parse_pid(state.get("pid")),
         parse_pid(pid_record.get("pid")),
     ]
     candidates = [pid for pid in candidates if pid is not None]
 
+    if lock_state is not None:
+        return GatewayPresence(candidates[0] if candidates else None, lock_state, "gateway.lock")
+
     for pid in candidates:
         if process_alive(pid):
-            return pid, True
+            return GatewayPresence(pid, True, "pid")
 
-    return (candidates[0], False) if candidates else (None, False)
+    return GatewayPresence(candidates[0] if candidates else None, False, "pid")
 
 
 def decide_and_recover(config: Config) -> int:
@@ -447,24 +545,47 @@ def decide_and_recover(config: Config) -> int:
     state = read_json(state_path) or {}
     pid_record = read_json(pid_path) or {}
 
-    pid, alive = resolve_gateway_pid(state, pid_record)
+    presence = resolve_gateway_presence(config, state, pid_record)
+    lease, lease_age = watchdog_lease_age(config)
     gateway_state = str(state.get("gateway_state", "")).strip().lower()
     age, explicit_heartbeat = runtime_heartbeat_age(state)
 
     log_line(
         config.log_file,
-        f"check pid={pid or 'none'} alive={alive} state={gateway_state or 'unknown'} "
-        f"heartbeat_age={age if age is not None else 'unknown'}s "
+        f"check pid={presence.pid or 'none'} alive={presence.alive} source={presence.source} "
+        f"state={gateway_state or 'unknown'} "
+        f"watchdog_age={format_age(lease_age)} "
+        f"heartbeat_age={format_age(age)} "
         f"heartbeat={'explicit' if explicit_heartbeat else 'legacy'}",
     )
 
-    if not alive:
+    if not presence.alive:
         clear_stale_tracker(config)
         return recover_start(config, "gateway process missing")
 
     if gateway_state == "startup_failed":
         clear_stale_tracker(config)
         return recover_restart(config, "gateway in startup_failed state")
+
+    if lease is not None:
+        if lease_age is None:
+            return track_and_maybe_restart(
+                config,
+                lease,
+                -1,
+                "gateway watchdog lease has no valid heartbeat_at",
+            )
+        if lease_age > config.watchdog_stale_seconds:
+            return track_and_maybe_restart(
+                config,
+                lease,
+                lease_age,
+                f"gateway watchdog lease is stale ({lease_age}s > {config.watchdog_stale_seconds}s)",
+            )
+
+        clear_stale_tracker(config)
+        log_line(config.log_file, "gateway watchdog lease fresh")
+        return 0
 
     stale_decision = evaluate_stale_decision(
         state,
@@ -473,18 +594,7 @@ def decide_and_recover(config: Config) -> int:
         explicit_heartbeat=explicit_heartbeat,
     )
     if stale_decision.should_track:
-        count = bump_stale_tracker(config, state, age=age or -1, reason=stale_decision.reason)
-        log_line(
-            config.log_file,
-            f"stale tracker {count}/{config.stale_confirmations}: {stale_decision.reason}",
-        )
-        if stale_decision.restart_allowed and count >= config.stale_confirmations:
-            clear_stale_tracker(config)
-            return recover_restart(
-                config,
-                f"confirmed stale runtime status after {count} checks: {stale_decision.reason}",
-            )
-        return 0
+        return track_and_maybe_restart(config, state, age or -1, stale_decision.reason)
 
     clear_stale_tracker(config)
     if age is not None and age > config.stale_seconds:

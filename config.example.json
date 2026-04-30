@@ -3,6 +3,7 @@
   "hermes_home": "/Users/you/.hermes/profiles/main",
   "profile": "main",
   "stale_seconds": 600,
+  "watchdog_stale_seconds": 60,
   "draining_stuck_seconds": 600,
   "stale_confirmations": 3,
   "log_file": "/Users/you/.hermes/profiles/main/logs/hermes-cpr.log",
