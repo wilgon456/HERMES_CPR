@@ -166,6 +166,12 @@ class HermesCPRTests(unittest.TestCase):
         start.assert_not_called()
         restart.assert_not_called()
         self.assertFalse(self.config.tracker_file.exists())
+        synced = json.loads((self.hermes_home / "gateway_state.json").read_text(encoding="utf-8"))
+        self.assertEqual(synced["heartbeat_at"], "fresh-watchdog")
+        self.assertEqual(synced["updated_at"], "fresh-watchdog")
+        self.assertEqual(synced["heartbeat_source"], "gateway_watchdog")
+        self.assertEqual(synced["gateway_state"], "running")
+        self.assertEqual(synced["platforms"], {"discord": {"state": "disconnected"}})
 
     def test_stale_watchdog_lease_restarts_even_with_connected_platform(self) -> None:
         self.write_state(

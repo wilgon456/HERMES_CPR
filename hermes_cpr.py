@@ -485,6 +485,38 @@ def watchdog_lease_age(config: Config) -> tuple[dict[str, Any] | None, int | Non
     return lease, seconds_since(lease.get("heartbeat_at"))
 
 
+def sync_runtime_status_from_watchdog(
+    config: Config,
+    state: dict[str, Any],
+    lease: dict[str, Any],
+) -> None:
+    """Mirror a fresh watchdog lease into gateway_state.json for diagnostics.
+
+    The watchdog lease is the authoritative liveness heartbeat used by CPR.
+    Keeping gateway_state.json in sync prevents dashboards and humans from
+    seeing an old gateway_state heartbeat and mistaking a healthy gateway for a
+    stale one.
+    """
+    heartbeat_at = lease.get("heartbeat_at")
+    if not isinstance(heartbeat_at, str) or not heartbeat_at.strip():
+        return
+
+    payload = dict(state) if isinstance(state, dict) else {}
+    payload.setdefault("kind", "hermes-gateway")
+    payload.setdefault("platforms", {})
+    for key in ("pid", "argv", "start_time"):
+        if key in lease:
+            payload[key] = lease[key]
+    if "state" in lease:
+        payload["gateway_state"] = lease["state"]
+    else:
+        payload.setdefault("gateway_state", "running")
+    payload["heartbeat_at"] = heartbeat_at
+    payload["updated_at"] = heartbeat_at
+    payload["heartbeat_source"] = "gateway_watchdog"
+    write_json(config.hermes_home / "gateway_state.json", payload)
+
+
 def format_age(age: int | None) -> str:
     return f"{age}s" if age is not None else "missing"
 
@@ -584,6 +616,7 @@ def decide_and_recover(config: Config) -> int:
             )
 
         clear_stale_tracker(config)
+        sync_runtime_status_from_watchdog(config, state, lease)
         log_line(config.log_file, "gateway watchdog lease fresh")
         return 0
 
